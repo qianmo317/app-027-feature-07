@@ -16,6 +16,7 @@ import { computeShape, shapeSignature, type ComputedShape } from './pipeline'
 import { buildBatchShape, buildJob, type Job } from './job'
 import { uid } from './geometry'
 import { importSvgText, type ImportResult } from './importer'
+import type { ImportRow } from './materialTransfer'
 import { defaultMaterials } from '@/data/materials'
 
 const LS_KEY = 'papercut-plotter-studio/v1'
@@ -418,18 +419,113 @@ export function upsertMaterial(m: MaterialPreset): void {
   scheduleSave()
 }
 
+/** 正在使用某条预设的项目（按下料最近修改排序由调用方决定，这里保持稳定顺序） */
+export function projectsUsingMaterial(id: string): Project[] {
+  return state.projects.filter((p) => p.materialId === id)
+}
+
+/** 删除/覆盖预设时需要重算的项目：materialId 指向旧 id 的项目 */
+function remapAndRecompute(oldId: string, newId: string): Project[] {
+  const affected: Project[] = []
+  if (oldId === newId) return affected
+  for (const p of state.projects) {
+    if (p.materialId === oldId) {
+      p.materialId = newId
+      recomputeProject(p, true)
+      affected.push(p)
+    }
+  }
+  return affected
+}
+
 export function deleteMaterial(id: string): void {
   const i = state.materials.findIndex((x) => x.id === id)
   if (i >= 0 && state.materials.length > 1) {
     state.materials.splice(i, 1)
-    for (const p of state.projects) {
-      if (p.materialId === id) {
-        p.materialId = state.materials[0].id
-        recomputeProject(p, true)
-      }
-    }
+    remapAndRecompute(id, state.materials[0].id)
     scheduleSave()
   }
+}
+
+/** 「应用到全部项目」前的快照，用于撤销（记录每个项目原来的预设） */
+export type ApplyAllSnapshot = { entries: Array<{ project: Project; fromId: string }> }
+
+export function applyMaterialToAll(materialId: string): ApplyAllSnapshot {
+  const snapshot: ApplyAllSnapshot = {
+    entries: state.projects.map((p) => ({ project: p, fromId: p.materialId })),
+  }
+  for (const p of state.projects) {
+    if (p.materialId !== materialId) {
+      p.materialId = materialId
+      recomputeProject(p, true)
+    }
+  }
+  scheduleSave()
+  return snapshot
+}
+
+export function undoApplyMaterialToAll(snapshot: ApplyAllSnapshot): void {
+  for (const { project, fromId } of snapshot.entries) {
+    // 原预设已被删除时回退到当前第一条，避免悬空引用
+    project.materialId = state.materials.some((m) => m.id === fromId) ? fromId : state.materials[0]?.id ?? ''
+    recomputeProject(project, true)
+  }
+  scheduleSave()
+}
+
+export type MaterialImportResult = {
+  added: number
+  replaced: number
+  skipped: number
+  /** 因覆盖而参数发生变化、已重算刀路的项目名 */
+  affectedProjectNames: string[]
+}
+
+/**
+ * 提交材料预设导入：
+ * - replace：用文件里的预设覆盖本机同名预设（保留本机 id，正在使用它的项目随之改参数并重算）
+ * - copy：作为新预设加入（自动避让重名，生成新 id，不影响任何项目）
+ * - skip：不处理
+ * 无效（带校验错误）的行一律跳过。
+ */
+export function commitMaterialImport(
+  rows: ImportRow[],
+  finalNames: Map<number, string>,
+): MaterialImportResult {
+  const affected = new Set<Project>()
+  let added = 0
+  let replaced = 0
+  let skipped = 0
+  for (const row of rows) {
+    if (row.action === 'skip' || row.errors.length > 0) {
+      skipped += 1
+      continue
+    }
+    if (row.action === 'replace' && row.localSameName) {
+      const target = row.localSameName
+      const incoming = row.preset
+      const merged: MaterialPreset = {
+        id: target.id,
+        name: target.name,
+        paper: incoming.paper,
+        force: incoming.force,
+        speedMmS: incoming.speedMmS,
+        passes: incoming.passes,
+        bladeOffsetMm: incoming.bladeOffsetMm,
+        backing: incoming.backing,
+      }
+      upsertMaterial(merged)
+      for (const p of projectsUsingMaterial(target.id)) affected.add(p)
+      replaced += 1
+      continue
+    }
+    const name = finalNames.get(row.index) ?? row.preset.name.trim()
+    upsertMaterial({ ...row.preset, id: uid('mat'), name })
+    added += 1
+  }
+  for (const p of affected) recomputeProject(p, true)
+  scheduleSave()
+  return { added, replaced, skipped, affectedProjectNames: [...affected].map((p) => p.name) }
 }
 
 // ---------------- 导入 ----------------
@@ -488,6 +584,10 @@ export const store = {
   applySymmetry,
   upsertMaterial,
   deleteMaterial,
+  projectsUsingMaterial,
+  applyMaterialToAll,
+  undoApplyMaterialToAll,
+  commitMaterialImport,
   recomputeProject,
   recomputeAll,
   importSvgToShapes,
