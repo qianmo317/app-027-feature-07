@@ -17,6 +17,7 @@ import { buildBatchShape, buildJob, type Job } from './job'
 import { uid } from './geometry'
 import { importSvgText, type ImportResult } from './importer'
 import { defaultMaterials } from '@/data/materials'
+import { validateMaterial, type ImportPlan, type MaterialErrors } from './material-io'
 
 const LS_KEY = 'papercut-plotter-studio/v1'
 
@@ -31,6 +32,8 @@ type StoreState = {
   materials: MaterialPreset[]
   ready: boolean
   lastError: string | null
+  /** 从本地存储读出的越界 / 不完整预设（id → 字段问题），界面提示修订 */
+  materialIssues: Record<string, MaterialErrors>
 }
 
 export const state = reactive<StoreState>({
@@ -38,6 +41,7 @@ export const state = reactive<StoreState>({
   materials: [],
   ready: false,
   lastError: null,
+  materialIssues: {},
 })
 
 /** 派生计算结果缓存（按几何签名失效，不持久化） */
@@ -66,7 +70,9 @@ export function loadState(): void {
         state.projects = parsed.projects.map(normalizeProject)
       }
       if (parsed && Array.isArray(parsed.materials) && parsed.materials.length > 0) {
-        state.materials = parsed.materials.map((m) => ({ ...m, backing: m.backing ?? '常规垫板' }))
+        const loaded = parsed.materials.map((m) => ({ ...m, backing: m.backing ?? '常规垫板' }))
+        state.materials = loaded
+        state.materialIssues = detectMaterialIssues(loaded)
       }
     }
   } catch (e) {
@@ -74,6 +80,20 @@ export function loadState(): void {
   }
   state.ready = true
   recomputeAll()
+}
+
+/** 旧数据体检：只做区间校验（不查重名，避免互相报错），供界面标红提示修订 */
+function detectMaterialIssues(materials: MaterialPreset[]): Record<string, MaterialErrors> {
+  const issues: Record<string, MaterialErrors> = {}
+  for (const m of materials) {
+    const r = validateMaterial(m)
+    if (Object.keys(r.errors).length > 0) issues[m.id] = r.errors
+  }
+  return issues
+}
+
+export function refreshMaterialIssues(): void {
+  state.materialIssues = detectMaterialIssues(state.materials)
 }
 
 export function saveNow(): void {
@@ -415,20 +435,110 @@ export function upsertMaterial(m: MaterialPreset): void {
   const i = state.materials.findIndex((x) => x.id === m.id)
   if (i >= 0) state.materials[i] = { ...m }
   else state.materials.push({ ...m })
+  delete state.materialIssues[m.id]
   scheduleSave()
 }
 
-export function deleteMaterial(id: string): void {
+/** 正在使用某条预设的项目（删除 / 覆盖 / 应用到全部前的影响范围提示） */
+export function projectsUsingMaterial(materialId: string): Project[] {
+  return state.projects.filter((p) => p.materialId === materialId)
+}
+
+/**
+ * 删除材料预设。
+ * 使用该预设的项目会切换到 fallbackId（默认保留列表里的第一条），并返回受影响的项目。
+ */
+export function deleteMaterial(id: string, fallbackId?: string): Project[] {
   const i = state.materials.findIndex((x) => x.id === id)
-  if (i >= 0 && state.materials.length > 1) {
-    state.materials.splice(i, 1)
-    for (const p of state.projects) {
-      if (p.materialId === id) {
-        p.materialId = state.materials[0].id
-        recomputeProject(p, true)
-      }
+  if (i < 0 || state.materials.length <= 1) return []
+  const rest = state.materials.filter((m) => m.id !== id)
+  const fallback = rest.find((m) => m.id === fallbackId) ?? rest[0]
+  const affected: Project[] = []
+  state.materials.splice(i, 1)
+  for (const p of state.projects) {
+    if (p.materialId === id) {
+      p.materialId = fallback.id
+      affected.push(p)
+      recomputeProject(p, true)
     }
-    scheduleSave()
+  }
+  delete state.materialIssues[id]
+  scheduleSave()
+  return affected
+}
+
+// ---------------- 应用到全部项目（可撤销） ----------------
+
+export type ApplyAllSnapshot = {
+  materialId: string
+  /** 应用前每个项目的材料选择 */
+  prev: Array<{ projectId: string; materialId: string }>
+  changed: Project[]
+}
+
+/** 把某条预设应用到全部项目，返回快照用于撤销；没有项目返回 null */
+export function applyMaterialToAll(materialId: string): ApplyAllSnapshot | null {
+  if (!state.materials.some((m) => m.id === materialId) || state.projects.length === 0) return null
+  const snapshot: ApplyAllSnapshot = {
+    materialId,
+    prev: state.projects.map((p) => ({ projectId: p.id, materialId: p.materialId })),
+    changed: [],
+  }
+  for (const p of state.projects) {
+    if (p.materialId !== materialId) {
+      p.materialId = materialId
+      snapshot.changed.push(p)
+      recomputeProject(p, true)
+    }
+  }
+  scheduleSave()
+  return snapshot
+}
+
+/** 撤销应用到全部：按快照恢复各项目原来的材料选择 */
+export function undoApplyMaterialToAll(snapshot: ApplyAllSnapshot): void {
+  for (const entry of snapshot.prev) {
+    const p = state.projects.find((x) => x.id === entry.projectId)
+    if (p && state.materials.some((m) => m.id === entry.materialId)) {
+      if (p.materialId !== entry.materialId) recomputeProject(p, true)
+      p.materialId = entry.materialId
+    }
+  }
+  scheduleSave()
+}
+
+export type ImportMaterialsResult = {
+  addCount: number
+  renameCount: number
+  overwriteCount: number
+  affectedProjects: Project[]
+}
+
+/** 执行导入计划：新增 / 另存为新增、覆盖时保留本机 id 并对引用项目重算刀路 */
+export function importMaterials(plan: ImportPlan): ImportMaterialsResult {
+  const affectedIds = new Set<string>()
+  for (const op of plan.ops) {
+    if (op.kind === 'overwrite') {
+      const i = state.materials.findIndex((m) => m.id === op.localId)
+      if (i >= 0) state.materials[i] = { ...op.preset }
+      for (const p of state.projects) {
+        if (p.materialId === op.localId) {
+          affectedIds.add(p.id)
+          recomputeProject(p, true)
+        }
+      }
+      delete state.materialIssues[op.localId]
+    } else {
+      state.materials.push({ ...op.preset })
+    }
+  }
+  refreshMaterialIssues()
+  scheduleSave()
+  return {
+    addCount: plan.addCount,
+    renameCount: plan.renameCount,
+    overwriteCount: plan.overwriteCount,
+    affectedProjects: state.projects.filter((p) => affectedIds.has(p.id)),
   }
 }
 
@@ -488,6 +598,11 @@ export const store = {
   applySymmetry,
   upsertMaterial,
   deleteMaterial,
+  projectsUsingMaterial,
+  applyMaterialToAll,
+  undoApplyMaterialToAll,
+  importMaterials,
+  refreshMaterialIssues,
   recomputeProject,
   recomputeAll,
   importSvgToShapes,
